@@ -1,3 +1,5 @@
+1.1.0-RMN
+- Send all https requests using TLS v1.1
 1.1.0
 - Python 2.6 support thanks to VIVIDboarder: https://github.com/heroku/salesforce-bulk/pull/17
 - https://github.com/heroku/salesforce-bulk/pull/19

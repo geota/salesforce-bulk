@@ -28,7 +28,7 @@ with open('LICENSE') as f:
 
 setup(
     name='salesforce-bulk',
-    version='1.1.0',
+    version='1.1.0-RMN',
     description='Python interface to the Salesforce.com Bulk API.',
     long_description=readme,
     author='Scott Persinger',
