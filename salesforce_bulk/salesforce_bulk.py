@@ -3,21 +3,30 @@ from __future__ import absolute_import
 # Interface to the Salesforce BULK API
 import os
 from collections import namedtuple
-from httplib2 import Http
-import requests
-import urllib2
+import ssl
 import urlparse
 import requests
 import xml.etree.ElementTree as ET
-from tempfile import TemporaryFile, NamedTemporaryFile
+from tempfile import TemporaryFile
 import StringIO
 import re
 import time
 import csv
 
+from requests.adapters import HTTPAdapter
+from requests.packages.urllib3.poolmanager import PoolManager
+
 from . import bulk_states
 
 UploadResult = namedtuple('UploadResult', 'id success created error')
+
+
+class Tls11HttpAdapter(HTTPAdapter):
+    """"Transport adapter" that allows us to use TLS 1.1."""
+    def init_poolmanager(self, connections, maxsize, block=False):
+        self.poolmanager = PoolManager(
+            num_pools=connections, maxsize=maxsize,
+            block=block, ssl_version=ssl.PROTOCOL_TLSv1_1)
 
 
 class BulkApiError(Exception):
@@ -61,10 +70,14 @@ class SalesforceBulk(object):
             host = urlparse.urlparse(endpoint)
             host = host.hostname.replace("-api", "")
 
+        self.session = requests.Session()
+
         if host[0:4] == 'http':
             self.endpoint = host
         else:
             self.endpoint = "https://" + host
+            self.session.mount("https://", Tls11HttpAdapter())
+
         self.endpoint += "/services/async/%s" % API_version
         self.sessionId = sessionId
         self.jobNS = 'http://www.force.com/2009/06/asyncapi/dataload'
@@ -130,45 +143,40 @@ class SalesforceBulk(object):
                                   concurrency=concurrency,
                                   external_id_name=external_id_name)
 
-        http = Http()
-        resp, content = http.request(self.endpoint + "/job",
-                                     "POST",
-                                     headers=self.headers(),
-                                     body=doc)
+        resp = self.session.post(self.endpoint + "/job",
+                             data=doc,
+                             headers=self.headers())
 
-        self.check_status(resp, content)
+        self.check_status(resp)
 
-        tree = ET.fromstring(content)
+        tree = ET.fromstring(resp.content)
         job_id = tree.findtext("{%s}id" % self.jobNS)
         self.jobs[job_id] = job_id
 
         return job_id
 
-    def check_status(self, resp, content):
+    def check_status(self, resp):
         if resp.status >= 400:
-            msg = "Bulk API HTTP Error result: {0}".format(content)
+            msg = "Bulk API HTTP Error result: {0}".format(resp.content)
             self.raise_error(msg, resp.status)
 
     def close_job(self, job_id):
         doc = self.create_close_job_doc()
-        http = Http()
         url = self.endpoint + "/job/%s" % job_id
-        resp, content = http.request(url, "POST", headers=self.headers(),
-                                     body=doc)
-        self.check_status(resp, content)
+        resp = self.session.post(url,
+                             data=doc,
+                             headers=self.headers())
+        self.check_status(resp)
 
     def abort_job(self, job_id):
         """Abort a given bulk job"""
         doc = self.create_abort_job_doc()
-        http = Http()
         url = self.endpoint + "/job/%s" % job_id
-        resp, content = http.request(
-            url,
-            "POST",
-            headers=self.headers(),
-            body=doc
-        )
-        self.check_status(resp, content)
+        resp = self.session.post(url,
+                      data=doc,
+                      headers=self.headers())
+
+        self.check_status(resp)
 
     def create_job_doc(self, object_name=None, operation=None,
                        contentType='CSV', concurrency=None, external_id_name=None):
@@ -222,15 +230,16 @@ class SalesforceBulk(object):
             job_id = self.create_job(
                 re.search(re.compile("from (\w+)", re.I), soql).group(1),
                 "query")
-        http = Http()
         uri = self.endpoint + "/job/%s/batch" % job_id
         headers = self.headers({"Content-Type": "text/csv"})
-        resp, content = http.request(uri, method="POST", body=soql,
-                                     headers=headers)
 
-        self.check_status(resp, content)
+        resp = self.session.post(uri,
+                             data=soql,
+                             headers=headers)
 
-        tree = ET.fromstring(content)
+        self.check_status(resp)
+
+        tree = ET.fromstring(resp.content)
         batch_id = tree.findtext("{%s}id" % self.jobNS)
 
         self.batches[batch_id] = job_id
@@ -265,7 +274,7 @@ class SalesforceBulk(object):
         uri = self.endpoint + "/job/%s/batch" % job_id
         headers = self.headers({"Content-Type": "text/csv"})
         for batch in batches:
-            resp = requests.post(uri, data=batch, headers=headers)
+            resp = self.session.post(uri, data=batch, headers=headers)
             content = resp.content
 
             if resp.status_code >= 400:
@@ -291,7 +300,7 @@ class SalesforceBulk(object):
     def post_bulk_batch(self, job_id, csv_generator):
         uri = self.endpoint + "/job/%s/batch" % job_id
         headers = self.headers({"Content-Type": "text/csv"})
-        resp = requests.post(uri, data=csv_generator, headers=headers)
+        resp = self.session.post(uri, data=csv_generator, headers=headers)
         content = resp.content
 
         if resp.status_code >= 400:
@@ -318,15 +327,15 @@ class SalesforceBulk(object):
 
         if job_id is None:
             job_id = self.create_job(object_type, "delete")
-        http = Http()
+
         # Split a large CSV into manageable batches
         batches = self.split_csv(csv, batch_size)
         batch_ids = []
 
         uri = self.endpoint + "/job/%s/batch" % job_id
         headers = self.headers({"Content-Type": "text/csv"})
-        for batch in results:
-            resp = requests.post(uri, data=batch, headers=headers)
+        for batch in batches:
+            resp = self.session.post(uri, data=batch, headers=headers)
             content = resp.content
 
             if resp.status_code >= 400:
@@ -351,7 +360,7 @@ class SalesforceBulk(object):
         job_id = job_id or self.lookup_job_id(batch_id)
         uri = urlparse.urljoin(self.endpoint +"/",
             'job/{0}'.format(job_id))
-        response = requests.get(uri, headers=self.headers())
+        response = self.session.get(uri, headers=self.headers())
         if response.status_code != 200:
             self.raise_error(response.content, response.status_code)
 
@@ -374,13 +383,12 @@ class SalesforceBulk(object):
 
         job_id = job_id or self.lookup_job_id(batch_id)
 
-        http = Http()
         uri = self.endpoint + \
             "/job/%s/batch/%s" % (job_id, batch_id)
-        resp, content = http.request(uri, headers=self.headers())
-        self.check_status(resp, content)
+        resp = self.session.get(uri, headers=self.headers())
+        self.check_status(resp)
 
-        tree = ET.fromstring(content)
+        tree = ET.fromstring(resp.content)
         result = {}
         for child in tree:
             result[re.sub("{.*?}", "", child.tag)] = child.text
@@ -421,7 +429,7 @@ class SalesforceBulk(object):
             "job/{0}/batch/{1}/result".format(
                 job_id, batch_id),
         )
-        resp = requests.get(uri, headers=self.headers())
+        resp = self.session.get(uri, headers=self.headers())
         if resp.status_code != 200:
             return False
 
@@ -464,7 +472,7 @@ class SalesforceBulk(object):
                 job_id, batch_id, result_id),
         )
         logger('Downloading bulk result file id=#{0}'.format(result_id))
-        resp = requests.get(uri, headers=self.headers(), stream=True)
+        resp = self.session.get(uri, headers=self.headers(), stream=True)
 
         if not parse_csv:
             iterator = resp.iter_lines()
@@ -500,13 +508,13 @@ class SalesforceBulk(object):
 
         uri = self.endpoint + \
             "/job/%s/batch/%s/result" % (job_id, batch_id)
-        r = requests.get(uri, headers=self.headers(), stream=True)
+        r = self.session.get(uri, headers=self.headers(), stream=True)
 
         result_id = r.text.split("<result>")[1].split("</result>")[0]
 
         uri = self.endpoint + \
             "/job/%s/batch/%s/result/%s" % (job_id, batch_id, result_id)
-        r = requests.get(uri, headers=self.headers(), stream=True)
+        r = self.session.get(uri, headers=self.headers(), stream=True)
 
         if parse_csv:
             return csv.DictReader(r.iter_lines(chunk_size=2048), delimiter=",",
@@ -521,13 +529,12 @@ class SalesforceBulk(object):
 
         if not self.is_batch_done(job_id, batch_id):
             return False
-        http = Http()
         uri = self.endpoint + \
             "/job/%s/batch/%s/result" % (job_id, batch_id)
-        resp, content = http.request(uri, method="GET", headers=self.headers())
+        resp = self.session.get(uri, headers=self.headers())
 
         tf = TemporaryFile()
-        tf.write(content)
+        tf.write(resp.content)
 
         total_remaining = self.count_file_lines(tf)
         if logger:
